@@ -11,15 +11,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/avast/retry-go"
-	"github.com/gin-gonic/gin"
-	"github.com/google/go-github/v62/github"
-	"github.com/robfig/cron/v3"
-	"github.com/spf13/viper"
-	"golang.org/x/crypto/nacl/box"
-	"gopkg.in/yaml.v3"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
 	template2 "html/template"
 	"io"
 	"log"
@@ -33,6 +24,16 @@ import (
 	"strings"
 	"text/template"
 	"time"
+
+	"github.com/avast/retry-go"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/google/go-github/v62/github"
+	"github.com/robfig/cron/v3"
+	"github.com/spf13/viper"
+	"golang.org/x/crypto/nacl/box"
+	"gopkg.in/yaml.v3"
+	"gorm.io/gorm"
 )
 
 var cfg Cfg
