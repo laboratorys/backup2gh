@@ -36,13 +36,9 @@ jobs:
           v: true
           x: false
           race: false
+          ldflags: -s -w -linkmode external -extldflags "-static"
+          buildmode: default
           trimpath: true
-          build_tags: netgo
-          # 核心：-linkmode external -extldflags "-static" 强制全静态链接
-          # 这样编译出的二进制文件不依赖 glibc，也不依赖 musl，在任何 Linux 环境都能跑
-          ldflags: |
-            -s -w
-            ${{ contains(matrix.target, 'linux') && '-linkmode external -extldflags "-static"' || '' }}
 
       - name: Post-Build Packaging
         run: |
