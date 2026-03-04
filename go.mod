@@ -1,6 +1,6 @@
 module github.com/laboratorys/backup-to-github
 
-go 1.24.2
+go 1.25.1
 
 require (
 	github.com/avast/retry-go v3.0.0+incompatible
