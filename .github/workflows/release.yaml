@@ -13,7 +13,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # xgo 的格式是 goos/goarch
         target:
           - linux/amd64
           - linux/arm64
@@ -24,9 +23,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@v4
 
       - name: Build with xgo
         uses: crazy-max/ghaction-xgo@v4
@@ -39,7 +36,10 @@ jobs:
           v: true
           x: false
           race: false
+          trimpath: true
           build_tags: netgo
+          # 核心：-linkmode external -extldflags "-static" 强制全静态链接
+          # 这样编译出的二进制文件不依赖 glibc，也不依赖 musl，在任何 Linux 环境都能跑
           ldflags: |
             -s -w
             ${{ contains(matrix.target, 'linux') && '-linkmode external -extldflags "-static"' || '' }}
@@ -47,32 +47,28 @@ jobs:
       - name: Post-Build Packaging
         run: |
           cd dist
-          # 将 matrix.target 中的斜杠替换为横杠 (例如 linux/amd64 -> linux-amd64)
+          # 格式化目标名称 (如 linux/amd64 -> linux-amd64)
           TARGET_STR=$(echo "${{ matrix.target }}" | sed 's/\//-/g')
           
-          # 匹配 xgo 生成的原始文件 (通常类似于 backup2gh-linux-amd64)
-          # 注意：xgo 对某些平台可能会生成 backup2gh-windows-4.0-386.exe 这种带版本的文件名
+          # 查找 xgo 生成的文件
           RAW_FILE=$(ls backup2gh*)
 
           if [[ "${{ matrix.target }}" == windows* ]]; then
-            # Windows 处理：重命名为简洁名并打包成 .zip
+            # Windows: 重命名为简洁名并打包成 .zip
             mv "$RAW_FILE" backup2gh.exe
             zip "backup2gh-${TARGET_STR}.zip" backup2gh.exe
-            echo "Generated: backup2gh-${TARGET_STR}.zip"
           else
-            # Linux/Darwin 处理：重命名并打包成 .tar.gz
+            # Linux/Darwin: 重命名并打包成 .tar.gz
             mv "$RAW_FILE" backup2gh
             tar -czvf "backup2gh-${TARGET_STR}.tar.gz" backup2gh
-            echo "Generated: backup2gh-${TARGET_STR}.tar.gz"
           fi
           
-          # 清理：只保留压缩后的资源，防止上传重复的文件
+          # 清理原始文件，只保留压缩包
           find . -maxdepth 1 -not -name "*.zip" -not -name "*.tar.gz" -type f -delete
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          # 只上传生成的压缩包
           files: dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
