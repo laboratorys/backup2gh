@@ -28,11 +28,11 @@ import (
 	"github.com/avast/retry-go"
 	"github.com/gin-gonic/gin"
 	"github.com/google/go-github/v62/github"
+	"github.com/libtnb/sqlite"
 	"github.com/robfig/cron/v3"
 	"github.com/spf13/viper"
 	"golang.org/x/crypto/nacl/box"
 	"gopkg.in/yaml.v3"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
@@ -77,10 +77,10 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git checkout --orphan tmp
-          git add -A				# Add all files and commit them
+          git add -A             # Add all files and commit them
           git commit -m "Reset all files"
-          git branch -D $DEFAULT_BRANCH		# Deletes the default branch
-          git branch -m $DEFAULT_BRANCH		# Rename the current branch to defaul
+          git branch -D $DEFAULT_BRANCH    # Deletes the default branch
+          git branch -m $DEFAULT_BRANCH    # Rename the current branch to defaul
       - name: Push changes
         uses: ad-m/github-push-action@master
         with:
@@ -101,6 +101,10 @@ func main() {
 	initConfig()
 	// 初始化日志文件
 	initLogFile()
+	if logFile != nil {
+		defer logFile.Close()
+	}
+
 	if cfg.BakRepo != "" && cfg.BakRepoOwner != "" && cfg.BakGithubToken != "" {
 		LogEnv()
 		if cfg.StartWithRestore == "1" {
@@ -120,6 +124,9 @@ func main() {
 				gin.SetMode(gin.ReleaseMode)
 			}
 			r := gin.Default()
+			// 增加 Gin 自带的 Recovery 中间件，防止 Web 路由崩溃导致整个进程挂掉
+			r.Use(gin.Recovery())
+
 			t, _ := template2.New("custom").Delims("<<", ">>").ParseFS(templatesFS, "templates/*")
 			r.SetHTMLTemplate(t)
 			basePath := ""
@@ -135,13 +142,6 @@ func main() {
 					"title":     "backup2gh",
 					"base_path": basePath,
 				})
-				//test
-				/*data, err := os.ReadFile("D:\\backup2gh\\templates\\index.html")
-				if err != nil {
-					fmt.Println(err)
-					return
-				}
-				c.Data(http.StatusOK, "text/html; charset=utf-8", data)*/
 			})
 			authorized.GET("/config", func(c *gin.Context) {
 				c.JSON(http.StatusOK, cfg)
@@ -150,7 +150,15 @@ func main() {
 				c.JSON(http.StatusOK, getBackUps())
 			})
 			authorized.GET("/backup/run", func(c *gin.Context) {
-				go Backup()
+				// 修复漏洞 3：异步协程必须加上 recover，否则抛出 panic 会拉着整个程序一起死
+				go func() {
+					defer func() {
+						if err := recover(); err != nil {
+							errLog("手动备份协程发生严重错误: %v", err)
+						}
+					}()
+					_ = Backup()
+				}()
 				c.JSON(http.StatusOK, gin.H{})
 			})
 			authorized.POST("/config", func(c *gin.Context) {
@@ -192,7 +200,6 @@ func main() {
 	} else {
 		debugLog("No Valid Config found!")
 	}
-	defer logFile.Close()
 }
 
 func initLogFile() {
@@ -205,11 +212,6 @@ func initLogFile() {
 		mw := io.MultiWriter(os.Stdout, logFile)
 		log.SetOutput(mw)
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			debugLog("发生严重错误: %v\n", r)
-		}
-	}()
 }
 
 func getConfigData(exportType string) []byte {
@@ -250,6 +252,10 @@ func deleteBackup(dc github.RepositoryContent) error {
 	return err
 }
 func getClient() (*github.Client, error) {
+	if cfg.BakProxy == "" {
+		client := github.NewClient(nil).WithAuthToken(cfg.BakGithubToken)
+		return client, nil
+	}
 	proxyURL, err := url.Parse(cfg.BakProxy)
 	if err != nil {
 		log.Printf("Failed to parse proxy URL: %v", err)
@@ -259,12 +265,8 @@ func getClient() (*github.Client, error) {
 		Proxy: http.ProxyURL(proxyURL),
 	}
 
-	// 创建带有代理的 HTTP 客户端
 	httpClient := &http.Client{
 		Transport: transport,
-	}
-	if cfg.BakProxy == "" {
-		httpClient = nil
 	}
 	client := github.NewClient(httpClient).WithAuthToken(cfg.BakGithubToken)
 	return client, nil
@@ -356,14 +358,19 @@ func LogEnv() {
 	debugLog("WEB_PORT：%s", cfg.WebPort)
 	debugLog("WEB_PWD：%s", "****")
 	debugLog("WEB_PATH：%s", cfg.WebPath)
-	debugLog("WEB_PATH：%s", cfg.WebPath)
 	debugLog("SQLITE_PATH：%s", cfg.SqlitePath)
 	debugLog("EXEC_SQL：%s", cfg.ExecSql)
 	debugLog("EXEC_SQL_CRON：%s", cfg.ExecSqlCron)
 }
+
 func CronTask() {
 	cronManager.AddFunc(cfg.BakCron, func() {
-		retry.Do(
+		defer func() {
+			if err := recover(); err != nil {
+				errLog("定时备份Cron发生严重错误: %v", err)
+			}
+		}()
+		_ = retry.Do(
 			func() error {
 				return Backup()
 			},
@@ -374,7 +381,12 @@ func CronTask() {
 	})
 	if cfg.ExecSqlCron != "" {
 		cronManager.AddFunc(cfg.ExecSqlCron, func() {
-			retry.Do(
+			defer func() {
+				if err := recover(); err != nil {
+					errLog("执行清理SQL Cron发生严重错误: %v", err)
+				}
+			}()
+			_ = retry.Do(
 				func() error {
 					return ExecSql()
 				},
@@ -386,21 +398,48 @@ func CronTask() {
 	}
 	cronManager.Start()
 }
+
 func ExecSql() error {
+	if cfg.SqlitePath == "" || cfg.ExecSql == "" {
+		return nil
+	}
 	var err error
 	db, err := gorm.Open(sqlite.Open(cfg.SqlitePath), &gorm.Config{})
+	if err != nil {
+		debugLog("open sqlite failed: %v", err)
+		return err
+	}
+
+	sqlDB, err := db.DB()
 	if err == nil {
-		result := db.Exec(cfg.ExecSql)
-		if result.Error != nil {
-			debugLog("exec sql failed: %v", result.Error)
-			err = result.Error
-		} else {
-			rowsAffected := result.RowsAffected
-			debugLog("exec sql success: %d", rowsAffected)
+		defer sqlDB.Close()
+	}
+	finalSql := cfg.ExecSql
+	if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(cfg.ExecSql)); err == nil && len(decoded) > 0 {
+		if strings.Contains(strings.ToUpper(string(decoded)), "DELETE") || strings.Contains(strings.ToUpper(string(decoded)), "WHERE") {
+			finalSql = string(decoded)
+			debugLog("成功检测并解码 Base64 SQL: %s", finalSql)
 		}
 	}
-	return err
+	result := db.Exec(finalSql)
+	if result.Error != nil {
+		debugLog("exec sql failed: %v", result.Error)
+		return result.Error
+	}
+	debugLog("exec sql success, rows affected: %d", result.RowsAffected)
+
+	// 2. 执行 VACUUM 释放磁盘空间
+	debugLog("开始执行 SQLite VACUUM 紧缩整理...")
+	vacuumResult := db.Exec("VACUUM;")
+	if vacuumResult.Error != nil {
+		debugLog("VACUUM 失败: %v", vacuumResult.Error)
+		return vacuumResult.Error
+	}
+	debugLog("SQLite VACUUM 紧缩整理完成！")
+
+	return nil
 }
+
 func Restore() {
 	lockFile := "/tmp/restore.lock"
 	if _, err := os.Stat(lockFile); err == nil {
@@ -408,7 +447,6 @@ func Restore() {
 		return
 	}
 
-	// Create lock file
 	if err := os.WriteFile(lockFile, []byte("locked"), 0644); err != nil {
 		debugLog("Failed to create lock file: %v", err)
 		return
@@ -441,11 +479,17 @@ func Restore() {
 func RestoreFromContent(content *github.RepositoryContent) {
 	debugLog("Get Last Backup File: %s， Size: %d，Url: %s", content.GetPath(), content.GetSize(), content.GetDownloadURL())
 	dUrl := content.GetDownloadURL()
-	//下载、解压文件
 	zipFilePath := filepath.Join(tmpPath, *content.Name)
 	err := DownloadFile(dUrl, zipFilePath)
+	if err != nil {
+		errLog("DownloadFile 失败: %v", err)
+		return
+	}
 	debugLog("DownloadFile: %s", zipFilePath)
 	err = Unzip(zipFilePath, cfg.BakDataDir)
+	if err != nil {
+		errLog("Unzip 失败: %v", err)
+	}
 	err = os.Remove(zipFilePath)
 	debugLog("Unzip && Remove: %s", zipFilePath)
 	if err != nil {
@@ -476,24 +520,34 @@ func errLog(str string, v ...any) {
 func getBackUps() []*github.RepositoryContent {
 	ctx := context.Background()
 	client, _ := getClient()
+	if client == nil {
+		return nil
+	}
 	_, dirContents, _, _ := client.Repositories.GetContents(ctx, cfg.BakRepoOwner, cfg.BakRepo, cfg.AppName, &github.RepositoryContentGetOptions{Ref: cfg.BakBranch})
 	return dirContents
 }
 
 func Backup() error {
 	ctx := context.Background()
-	chineseTimeStr(time.Now(), "200601021504")
 	fileName := chineseTimeStr(time.Now(), "200601021504") + ".zip"
 	zipFilePath := filepath.Join(tmpPath, fileName)
 	debugLog("Start Zip File: %s", zipFilePath)
 	tmpBakDir := filepath.Join(tmpPath, "data")
+
+	_ = os.RemoveAll(tmpBakDir)
+
 	er := CopyDir(cfg.BakDataDir, tmpBakDir)
 	if er != nil {
 		return er
 	}
-	Zip(tmpBakDir, zipFilePath)
-	commitMessage := "Add File"
-	fileContent, _ := os.ReadFile(zipFilePath)
+	err := Zip(tmpBakDir, zipFilePath)
+	if err != nil {
+		return err
+	}
+	fileContent, err := os.ReadFile(zipFilePath)
+	if err != nil {
+		return err
+	}
 	client, err := getClient()
 	if err != nil {
 		return err
@@ -514,13 +568,12 @@ func Backup() error {
 		return err
 	}
 	err = os.Remove(zipFilePath)
-	//查询仓库中备份文件数量
 	count, err := strconv.Atoi(cfg.BakMaxCount)
 	if err != nil {
 		count = 5
 	}
 	_, dirContents, _, _ := client.Repositories.GetContents(ctx, cfg.BakRepoOwner, cfg.BakRepo, cfg.AppName, &github.RepositoryContentGetOptions{Ref: cfg.BakBranch})
-	commitMessage = "clean file"
+	commitMessage := "clean file"
 	if len(dirContents) > count {
 		for i, dc := range dirContents {
 			if i+1 <= len(dirContents)-count {
@@ -530,9 +583,7 @@ func Backup() error {
 					Branch:  &cfg.BakBranch,
 				})
 			}
-
 		}
-
 	}
 	_, dirContents, _, _ = client.Repositories.GetContents(ctx, cfg.BakRepoOwner, cfg.BakRepo, "", &github.RepositoryContentGetOptions{Ref: cfg.BakBranch})
 	rows := [][]string{}
@@ -550,20 +601,30 @@ func Backup() error {
 						PerPage: 1,
 					},
 				})
-				commitDate := commits[0].GetCommit().GetAuthor().GetDate()
+				var commitDate time.Time
+				if len(commits) > 0 {
+					commitDate = commits[0].GetCommit().GetAuthor().GetDate().Time
+				} else {
+					commitDate = time.Now()
+				}
 				_, dcs, _, _ := client.Repositories.GetContents(ctx, cfg.BakRepoOwner, cfg.BakRepo, dc.GetPath(), &github.RepositoryContentGetOptions{Ref: cfg.BakBranch})
 				row := []string{}
 				i++
+				lastBakName := "none"
+				lastBakUrl := "#"
+				if len(dcs) > 0 {
+					lastBakName = dcs[len(dcs)-1].GetName()
+					lastBakUrl = dcs[len(dcs)-1].GetDownloadURL()
+				}
 				row = append(row,
 					fmt.Sprintf("%d", i),
 					dc.GetName(),
-					chineseTimeStr(commitDate.Time, "2006-01-02 15:04:05"),
-					fmt.Sprintf("[%s](%s)", dcs[len(dcs)-1].GetName(), dcs[len(dcs)-1].GetDownloadURL()))
+					chineseTimeStr(commitDate, "2006-01-02 15:04:05"),
+					fmt.Sprintf("[%s](%s)", lastBakName, lastBakUrl))
 				rows = append(rows, row)
 			}
 		}
 	}
-	_, dirContents, _, err = client.Repositories.GetContents(ctx, cfg.BakRepoOwner, cfg.BakRepo, "", &github.RepositoryContentGetOptions{Ref: cfg.BakBranch})
 	if len(rows) > 0 {
 		readmeContent := ReadmeData{
 			Title:      cfg.BakRepo,
@@ -593,6 +654,7 @@ func Backup() error {
 	}
 	return nil
 }
+
 func addRepoSecret(ctx context.Context, client *github.Client, owner string, repo, secretName string, secretValue string) error {
 	publicKey, _, err := client.Actions.GetRepoPublicKey(ctx, owner, repo)
 	if err != nil {
@@ -669,7 +731,6 @@ func AddOrUpdateFile(client *github.Client, ctx context.Context, branch, filePat
 }
 
 func DownloadFile(downUrl, filePath string) error {
-
 	tr := &http.Transport{TLSClientConfig: &tls.Config{
 		InsecureSkipVerify: true,
 	}}
@@ -680,7 +741,6 @@ func DownloadFile(downUrl, filePath string) error {
 		}
 	}
 
-	// 创建一个带有自定义 Transport 的 Client
 	client := &http.Client{Transport: tr}
 
 	req, err := http.NewRequest(http.MethodGet, downUrl, nil)
@@ -695,23 +755,21 @@ func DownloadFile(downUrl, filePath string) error {
 		defer r.Body.Close()
 	}
 
-	// 获得get请求响应的reader对象
 	reader := bufio.NewReaderSize(r.Body, 32*1024)
 	file, err := os.Create(filePath)
-	defer file.Close()
 	if err != nil {
 		return err
 	}
-	// 获得文件的writer对象
+	defer file.Close()
+
 	writer := bufio.NewWriter(file)
+	defer writer.Flush()
 
 	_, err = io.Copy(writer, reader)
 	return err
 }
 
-// CopyDir 递归复制文件夹
 func CopyDir(src, dst string) error {
-	// 校验源目录合法性
 	srcInfo, err := os.Stat(src)
 	if err != nil {
 		return fmt.Errorf("源目录不存在: %v", err)
@@ -720,53 +778,43 @@ func CopyDir(src, dst string) error {
 		return fmt.Errorf("%s 不是目录", src)
 	}
 
-	// 创建目标目录 (保留原目录权限)
 	if err := os.MkdirAll(dst, srcInfo.Mode()); err != nil {
 		return fmt.Errorf("创建目标目录失败: %v", err)
 	}
 
-	// 遍历源目录
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return err // 优先处理遍历错误
+			return err
 		}
 
-		// 计算相对路径
 		relPath, _ := filepath.Rel(src, path)
 		dstPath := filepath.Join(dst, relPath)
 
-		// 处理目录
 		if info.IsDir() {
 			return os.MkdirAll(dstPath, info.Mode())
 		}
 
-		// 处理常规文件
 		return copyFile(path, dstPath, info)
 	})
 }
 
-// copyFile 复制单个文件 (保留权限和时间戳)
 func copyFile(src, dst string, info os.FileInfo) error {
-	// 打开源文件
 	srcFile, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("打开源文件失败: %v", err)
 	}
 	defer srcFile.Close()
 
-	// 创建目标文件 (同权限)
 	dstFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
 	if err != nil {
 		return fmt.Errorf("创建目标文件失败: %v", err)
 	}
 	defer dstFile.Close()
 
-	// 复制内容
 	if _, err := io.Copy(dstFile, srcFile); err != nil {
 		return fmt.Errorf("复制内容失败: %v", err)
 	}
 
-	// 保留修改时间
 	if err := os.Chtimes(dst, info.ModTime(), info.ModTime()); err != nil {
 		return fmt.Errorf("保留时间戳失败: %v", err)
 	}
@@ -774,48 +822,55 @@ func copyFile(src, dst string, info os.FileInfo) error {
 	return nil
 }
 
-// 打包成zip文件
-func Zip(src_dir string, zip_file_name string) {
-	// 预防：旧文件无法覆盖
+// 修复漏洞 2：全面重构了 Zip 函数，对所有返回的 error 进行严格捕获处理，彻底杜绝 nil 导致的 Panic 崩溃
+func Zip(src_dir string, zip_file_name string) error {
 	os.RemoveAll(zip_file_name)
 
-	// 创建：zip文件
-	zipfile, _ := os.Create(zip_file_name)
+	zipfile, err := os.Create(zip_file_name)
+	if err != nil {
+		return err
+	}
 	defer zipfile.Close()
 
-	// 打开：zip文件
 	archive := zip.NewWriter(zipfile)
 	defer archive.Close()
 
-	// 遍历路径信息
-	filepath.Walk(src_dir, func(path string, info os.FileInfo, _ error) error {
-		// 如果是源路径，提前进行下一个遍历
+	return filepath.Walk(src_dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
 		if path == src_dir {
 			return nil
 		}
-		_, er := os.Stat(path)
-		if er != nil {
-			return nil
-		}
-		// 获取：文件头信息
-		header, err := zip.FileInfoHeader(info)
-		if err == nil {
-			relPath, _ := filepath.Rel(src_dir, path)
-			header.Name = filepath.ToSlash(relPath)
 
-			// 判断：文件是不是文件夹
-			if info.IsDir() {
-				header.Name += "/"
-			} else {
-				// 设置：zip的文件压缩算法
-				header.Method = zip.Deflate
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+
+		relPath, _ := filepath.Rel(src_dir, path)
+		header.Name = filepath.ToSlash(relPath)
+
+		if info.IsDir() {
+			header.Name += "/"
+		} else {
+			header.Method = zip.Deflate
+		}
+
+		writer, err := archive.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+
+		if !info.IsDir() {
+			file, err := os.Open(path)
+			if err != nil {
+				return err
 			}
-			// 创建：压缩包头部信息
-			writer, _ := archive.CreateHeader(header)
-			if !info.IsDir() {
-				file, _ := os.Open(path)
-				defer file.Close()
-				io.Copy(writer, file)
+			defer file.Close()
+			_, err = io.Copy(writer, file)
+			if err != nil {
+				return err
 			}
 		}
 		return nil
@@ -823,7 +878,6 @@ func Zip(src_dir string, zip_file_name string) {
 }
 
 func Unzip(zipPath, dstDir string) error {
-	// open zip file
 	reader, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return err
@@ -838,7 +892,6 @@ func Unzip(zipPath, dstDir string) error {
 }
 
 func unzipFile(file *zip.File, dstDir string) error {
-	// create the directory of file
 	filePath := path.Join(dstDir, file.Name)
 	if file.FileInfo().IsDir() {
 		if err := os.MkdirAll(filePath, os.ModePerm); err != nil {
@@ -850,21 +903,18 @@ func unzipFile(file *zip.File, dstDir string) error {
 		return err
 	}
 
-	// open the file
 	rc, err := file.Open()
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
 
-	// create the file
 	w, err := os.Create(filePath)
 	if err != nil {
 		return err
 	}
 	defer w.Close()
 
-	// save the decompressed file content
 	_, err = io.Copy(w, rc)
 	return err
 }

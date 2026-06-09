@@ -13,22 +13,18 @@ jobs:
     strategy:
       matrix:
         goos: [linux, windows, darwin]
-        goarch: ["386", amd64, arm64, "s390x"]
-        exclude:
-          - goarch: "386"
-            goos: darwin
-          - goarch: s390x
-            goos: windows
-          - goarch: s390x
-            goos: darwin
+        goarch: ["386", amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: wangyoucao577/go-release-action@v1
+        env:
+          CGO_ENABLED: "0"
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           goos: ${{ matrix.goos }}
           goarch: ${{ matrix.goarch }}
-          goversion: "https://go.dev/dl/go1.25.1.linux-amd64.tar.gz"
+          goversion: "https://go.dev/dl/go1.26.4.linux-amd64.tar.gz"
           binary_name: "backup2gh"
           asset_name: "backup2gh-${{ matrix.goos }}-${{ matrix.goarch }}"
           md5sum: false
+          build_flags: "-tags purego"
